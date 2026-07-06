@@ -1,0 +1,184 @@
+  name: Build Media3 FFmpeg Decoder
+
+  on:
+    workflow_dispatch:
+      inputs:
+        media3_version:
+          description: "Media3 version/tag, for example 1.10.1"
+          required: true
+          default: "1.10.1"
+        ffmpeg_ref:
+          description: "FFmpeg git ref, for example n6.0 or release/6.0"
+          required: true
+          default: "n6.0"
+        android_api:
+          description: "Android native API level"
+          required: true
+          default: "23"
+
+  jobs:
+    build:
+      name: Build media3 ffmpeg decoder
+      runs-on: ubuntu-latest
+
+      env:
+        MEDIA3_DIR: media
+        NDK_VERSION: "26.1.10909125"
+        CMAKE_VERSION: "3.22.1"
+        HOST_PLATFORM: linux-x86_64
+        ABIS: "armeabi-v7a arm64-v8a"
+        AUDIO_DECODERS: "aac mp3 ac3 eac3 truehd dca vorbis opus amrnb amrwb flac alac pcm_mulaw pcm_alaw"
+
+      steps:
+        - name: Setup Java
+          uses: actions/setup-java@v5
+          with:
+            distribution: temurin
+            java-version: "17"
+
+        - name: Setup Android SDK
+          uses: android-actions/setup-android@v3
+
+        - name: Checkout Media3
+          run: |
+            git clone --depth 1 --branch "${{ inputs.media3_version }}" https://github.com/androidx/media.git "$MEDIA3_DIR"
+
+        - name: Install Android SDK packages
+          working-directory: ${{ env.MEDIA3_DIR }}
+          run: |
+            COMPILE_SDK="$(sed -n "s/.*compileSdkVersion = \([0-9][0-9]*\).*/\1/p" constants.gradle)"
+            yes | sdkmanager --licenses >/dev/null
+            sdkmanager \
+              "platforms;android-${COMPILE_SDK}" \
+              "ndk;${NDK_VERSION}" \
+              "cmake;${CMAKE_VERSION}"
+
+        - name: Fetch FFmpeg
+          working-directory: ${{ env.MEDIA3_DIR }}/libraries/decoder_ffmpeg/src/main/jni
+          run: |
+            git clone --depth 1 --branch "${{ inputs.ffmpeg_ref }}" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+
+        - name: Build FFmpeg static libs for ARM ABIs only
+          working-directory: ${{ env.MEDIA3_DIR }}/libraries/decoder_ffmpeg/src/main/jni/ffmpeg
+          env:
+            FFMPEG_MODULE_PATH: ${{ github.workspace }}/${{ env.MEDIA3_DIR }}/libraries/decoder_ffmpeg/src/main
+            NDK_PATH: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+            ANDROID_ABI_LEVEL: ${{ inputs.android_api }}
+          run: |
+            set -euo pipefail
+
+            TOOLCHAIN_PREFIX="${NDK_PATH}/toolchains/llvm/prebuilt/${HOST_PLATFORM}/bin"
+            JOBS="$(nproc)"
+
+            COMMON_OPTIONS="
+              --target-os=android
+              --enable-static
+              --disable-shared
+              --disable-doc
+              --disable-programs
+              --disable-everything
+              --disable-avdevice
+              --disable-avformat
+              --disable-swscale
+              --disable-postproc
+              --disable-avfilter
+              --disable-symver
+              --enable-swresample
+              --extra-ldexeflags=-pie
+              --disable-v4l2-m2m
+              --disable-vulkan
+            "
+
+            for decoder in ${AUDIO_DECODERS}; do
+              COMMON_OPTIONS="${COMMON_OPTIONS} --enable-decoder=${decoder}"
+            done
+
+            ./configure \
+              --libdir=android-libs/armeabi-v7a \
+              --arch=arm \
+              --cpu=armv7-a \
+              --cross-prefix="${TOOLCHAIN_PREFIX}/armv7a-linux-androideabi${ANDROID_ABI_LEVEL}-" \
+              --nm="${TOOLCHAIN_PREFIX}/llvm-nm" \
+              --ar="${TOOLCHAIN_PREFIX}/llvm-ar" \
+              --ranlib="${TOOLCHAIN_PREFIX}/llvm-ranlib" \
+              --strip="${TOOLCHAIN_PREFIX}/llvm-strip" \
+              --extra-cflags="-march=armv7-a -mfloat-abi=softfp" \
+              --extra-ldflags="-Wl,--fix-cortex-a8" \
+              ${COMMON_OPTIONS}
+            make -j"${JOBS}"
+            make install-libs
+            make clean
+
+            ABI_64="${ANDROID_ABI_LEVEL}"
+            if [ "${ABI_64}" -lt 21 ]; then
+              ABI_64=21
+            fi
+
+            ./configure \
+              --libdir=android-libs/arm64-v8a \
+              --arch=aarch64 \
+              --cpu=armv8-a \
+              --cross-prefix="${TOOLCHAIN_PREFIX}/aarch64-linux-android${ABI_64}-" \
+              --nm="${TOOLCHAIN_PREFIX}/llvm-nm" \
+              --ar="${TOOLCHAIN_PREFIX}/llvm-ar" \
+              --ranlib="${TOOLCHAIN_PREFIX}/llvm-ranlib" \
+              --strip="${TOOLCHAIN_PREFIX}/llvm-strip" \
+              ${COMMON_OPTIONS}
+            make -j"${JOBS}"
+            make install-libs
+            make clean
+
+        - name: Restrict Media3 AAR native ABIs
+          working-directory: ${{ env.MEDIA3_DIR }}
+          run: |
+            sed -i "/android {/a\    defaultConfig { ndk { abiFilters 'armeabi-v7a', 'arm64-v8a' } }" \
+              libraries/decoder_ffmpeg/build.gradle
+
+        - name: Build decoder AAR
+          working-directory: ${{ env.MEDIA3_DIR }}
+          run: |
+            chmod +x gradlew
+            ./gradlew --no-daemon :lib-decoder-ffmpeg:assembleRelease
+
+        - name: Locate decoder AAR
+          id: locate_aar
+          working-directory: ${{ env.MEDIA3_DIR }}
+          run: |
+            set -euo pipefail
+
+            echo "AAR files:"
+            find libraries/decoder_ffmpeg -path "*/outputs/aar/*.aar" -type f -print
+
+            AAR="$(find libraries/decoder_ffmpeg -path "*/outputs/aar/*release.aar" -type f | head -n 1)"
+
+            if [ -z "${AAR}" ]; then
+              echo "No release AAR found under libraries/decoder_ffmpeg"
+              exit 1
+            fi
+
+            AAR_PATH="$(realpath "${AAR}")"
+            echo "Using AAR: ${AAR_PATH}"
+            echo "aar_path=${AAR_PATH}" >> "$GITHUB_OUTPUT"
+
+        - name: Verify AAR native ABIs
+          run: |
+            set -euo pipefail
+
+            AAR="${{ steps.locate_aar.outputs.aar_path }}"
+
+            unzip -l "$AAR" | grep "jni/"
+
+            unzip -l "$AAR" | grep -q "jni/armeabi-v7a/libffmpegJNI.so"
+            unzip -l "$AAR" | grep -q "jni/arm64-v8a/libffmpegJNI.so"
+
+            ! unzip -l "$AAR" | grep -q "jni/x86/"
+            ! unzip -l "$AAR" | grep -q "jni/x86_64/"
+
+            sha256sum "$AAR"
+
+        - name: Upload AAR
+          uses: actions/upload-artifact@v4
+          with:
+            name: media3-ffmpeg-decoder-${{ inputs.media3_version }}-${{ inputs.ffmpeg_ref }}-arm-audio-only
+            path: ${{ steps.locate_aar.outputs.aar_path }}
+            if-no-files-found: error
